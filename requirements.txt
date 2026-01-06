@@ -3,3 +3,4 @@ triton
 matplotlib
 pandas
 tabulate
+numpy
