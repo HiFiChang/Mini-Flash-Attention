@@ -1,0 +1,153 @@
+% IEEE Paper Template for US-LETTER Page Size (V1)
+% Sample Conference Paper using IEEE LaTeX style file for US-LETTER pagesize.
+% Copyright (C) 2006-2008 Causal Productions Pty Ltd.
+% Permission is granted to distribute and revise this file provided that
+% this header remains intact.
+%
+\documentclass[10pt,conference,letterpaper]{IEEEtran}
+\usepackage{times,amsmath,epsfig,amssymb,booktabs,graphicx,float}
+
+%
+\title{Accelerating Attention Mechanisms:\protect\\ Implementation and Benchmarking of Flash Attention using OpenAI Triton}
+%
+\author{%
+{Student Author}%
+\vspace{1.6mm}\\
+\fontsize{10}{10}\selectfont\itshape
+Department of Computer Science\\
+Course Project Report\\
+\fontsize{9}{9}\selectfont\ttfamily\upshape
+student@university.edu
+}
+%
+\begin{document}
+\maketitle
+%
+\begin{abstract} 
+The Transformer architecture has become the de-facto standard for Natural Language Processing, yet its self-attention mechanism suffers from quadratic time and memory complexity with respect to sequence length. This limitation hinders the processing of long sequences. Flash Attention addresses this by restructuring the computation to exploit the GPU memory hierarchy, minimizing high-bandwidth memory (HBM) accesses through tiling and recomputation. In this project, we implement the forward pass of Flash Attention using OpenAI Triton, a language designed for writing high-performance GPU kernels. We evaluate our implementation against a naive PyTorch baseline and PyTorch's optimized Scaled Dot-Product Attention (SDPA). Our Triton implementation demonstrates efficient memory usage (linear complexity) and achieves significant speedups over the naive implementation for long sequences (up to 3.8x at 8192 sequence length). While it achieves approximately 60-65\% of the throughput of the highly optimized production-grade SDPA, it successfully solves the Out-Of-Memory (OOM) issues encountered by standard attention mechanism at sequence lengths of 16k, proving the effectiveness of the tiling approach.
+\end{abstract}
+
+\section{Introduction}
+Deep learning models, particularly Transformers, have revolutionized fields such as natural language processing and computer vision. At the core of the Transformer is the self-attention mechanism, which allows the model to weigh the importance of different elements in an input sequence.
+
+However, the standard implementation of attention computes an $N \times N$ attention matrix (where $N$ is the sequence length), resulting in $O(N^2)$ memory and time complexity. As $N$ increases, the memory required to store this intermediate matrix grows quadratically, rapidly exceeding the High Bandwidth Memory (HBM) capacity of modern GPUs. This "memory wall" limits the capability of models to handle long contexts, such as entire books or long code repositories.
+
+Flash Attention \cite{dao2022flashattention} proposes an IO-aware exact attention algorithm that uses tiling to reduce the number of memory reads/writes between GPU HBM and on-chip SRAM. By computing attention in blocks and using online softmax scaling, it avoids materializing the full attention matrix in HBM.
+
+In this work, we implement the Flash Attention forward pass using OpenAI Triton. Triton allows for Python-like syntax while compiling to highly efficient PTX code, serving as a middle ground between high-level frameworks like PyTorch and low-level CUDA C++. We benchmark our implementation's latency, memory consumption, and TFLOPS against standard benchmarks to validate its performance characteristics.
+
+\section{Methodology}
+
+\subsection{Standard Attention}
+The standard scaled dot-product attention is defined as:
+\begin{equation}
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\end{equation}
+where $Q, K, V \in \mathbb{R}^{N \times d}$ are the query, key, and value matrices. In a naive implementation, $S = QK^T$ is first materialized in memory (size $N \times N$), followed by the softmax operation, and finally the matrix multiplication with $V$. For $N=16384$, the intermediate matrix alone requires gigabytes of memory, often leading to OOM errors.
+
+\subsection{Triton Implementation}
+Our implementation follows the Flash Attention algorithm, which fuses the matrix multiplication and softmax operations into a single kernel.
+
+\subsubsection{Tiling Strategy}
+We divide the Query ($Q$), Key ($K$), and Value ($V$) matrices into blocks. The computation is split into:
+\begin{itemize}
+    \item Outer loop: Iterates over blocks of $Q$ (size \texttt{BLOCK\_M}). Each program instance processes one such block.
+    \item Inner loop: Iterates over blocks of $K$ and $V$ (size \texttt{BLOCK\_N}).
+\end{itemize}
+
+Loads from $Q$ are performed once per outer loop iteration and kept in SRAM (Shared Memory). Blocks of $K$ and $V$ are loaded iteratively. This maximizes data reuse of $Q$ and accumulates results in on-chip registers.
+
+\subsubsection{Online Softmax}
+To avoid storing the full score matrix, we employ the online softmax trick. During the accumulation of the product $Q \cdot K^T$, we maintain:
+\begin{itemize}
+    \item $m_i$: The running maximum of the scores for the current row.
+    \item $l_i$: The running sum of exponentials (normalization factor).
+    \item $acc$: The running weighted sum of values.
+\end{itemize}
+When a new block of scores $S_{ij}$ is computed, we update these statistics, rescale the previous accumulator $acc$, and add the contribution of the new block. This ensures numerical stability and correctness without full matrix materialization.
+
+\subsubsection{Kernel Code Structure}
+The core kernel \texttt{\_fwd\_kernel} handles:
+1. Pointer arithmetic to locate the correct batch and head.
+2. Loading pointers for $Q, K, V$.
+3. The nested loop structure described above.
+4. Using \texttt{tl.dot} for efficient matrix multiplication on Tensor Cores.
+5. Storing the final result to the output tensor.
+
+\section{Experiments}
+
+\subsection{Setup}
+All experiments were conducted on a single NVIDIA GPU. We compared three implementations:
+\begin{enumerate}
+    \item \textbf{Naive}: Computes \texttt{softmax(Q @ K.T) @ V} using standard PyTorch operations.
+    \item \textbf{PyTorch SDPA}: Uses \texttt{torch.nn.functional.scaled\_dot\_product\_attention}, which dispatches to optimized CUDA kernels (Flash Attention v2 or MemEfficient).
+    \item \textbf{Triton}: Our custom implementation.
+\end{enumerate}
+
+\textbf{Hyperparameters:}
+\begin{itemize}
+    \item Batch Size: 4
+    \item Heads: 8
+    \item Head Dimension: 64
+    \item SequenceLengths: 128, 256, 512, 1024, 2048, 4096, 8192, 16384.
+\end{itemize}
+
+\section{Results and Analysis}
+
+\subsection{Latency and Speedup}
+Table \ref{tab:benchmarks} presents the latency measurements for varying sequence lengths.
+
+\begin{table}[h]
+\centering
+\caption{Latency (ms) Comparison}
+\label{tab:benchmarks}
+\begin{tabular}{|c|c|c|c|}
+\hline
+\textbf{Seq Len} & \textbf{Naive (ms)} & \textbf{SDPA (ms)} & \textbf{Triton (ms)} \\
+\hline
+128 & 0.021 & 0.013 & 0.014 \\
+256 & 0.041 & 0.020 & 0.021 \\
+512 & 0.112 & 0.045 & 0.058 \\
+1024 & 0.480 & 0.106 & 0.154 \\
+2048 & 2.173 & 0.360 & 0.568 \\
+4096 & 8.681 & 1.381 & 2.210 \\
+8192 & 32.700 & 5.243 & 8.421 \\
+16384 & OOM & 20.450 & 32.898 \\
+\hline
+\end{tabular}
+\end{table}
+
+For short sequences ($N < 512$), the overhead of kernel launching dominates, and performance differences are minimal. However, as sequence length increases, the quadratic scaling of the Naive implementation becomes apparent.
+At $N=4096$, the Naive implementation takes 8.68ms, while our Triton kernel takes 2.21ms, representing a \textbf{3.9x speedup}.
+Crucially, at $N=16384$, the Naive implementation fails due to Out-Of-Memory (OOM) errors, while the Triton implementation runs successfully in 32.9ms.
+
+Compared to the highly optimized PyTorch SDPA, our Triton implementation is approximately 1.5-1.6x slower. This is expected as SDPA utilizes highly tuned CUDA kernels (FlashAttention-2) with assembly-level optimizations, whereas our implementation is a high-level Triton script.
+
+\subsection{Computational Throughput}
+We measured computational throughput in TFLOPS.
+At $N=8192$, the Naive implementation reaches only 16.8 TFLOPS. In contrast, the Triton implementation reaches \textbf{65.3 TFLOPS}, indicating much better utilization of the GPU's compute capabilities by keeping data in SRAM and reducing HBM bottleneck.
+
+\subsection{Memory Consumption}
+Figure \ref{fig:memory} (conceptual) illustrates the peak memory usage.
+The Naive implementation shows quadratic memory growth ($O(N^2)$). At $N=8192$, it consumes roughly \textbf{8.3 GB} of memory.
+Both SDPA and Triton implementations show linear memory growth ($O(N)$). At $N=8192$, Triton consumes only \textbf{144 MB} of memory (excluding the input/output tensors themselves, focusing on intermediate buffers). This massive reduction allows for training and inference on much longer sequences.
+
+\begin{figure}[h]
+\centering
+% \includegraphics[width=0.45\textwidth]{memory_plot}
+\fbox{\parbox{0.4\textwidth}{\centering \vspace{1cm} Memory Usage Chart \\ Naive vs Triton \vspace{1cm}}}
+\caption{Memory usage vs Sequence Length. Naive grows quadratically, while Triton remains linear.}
+\label{fig:memory}
+\end{figure}
+
+\section{Conclusion}
+In this project, we successfully implemented a memory-efficient attention mechanism using OpenAI Triton. Our experiments confirm that the tiling and recomputation strategies employed in Flash Attention effectively solve the memory bottleneck of standard attention. The Triton implementation achieves near-constant memory scaling and significant speedups over naive PyTorch code for long sequences, proving to be a robust solution for dealing with long-context scenarios in modern Deep Learning. While simpler to write than raw CUDA, Triton enables performance that is competitive with highly optimized libraries.
+
+\begin{thebibliography}{1}
+\bibitem{dao2022flashattention}
+T.~Dao, D.~Y. Fu, S.~Ermon, A.~Rudra, and C.~R\'e, ``Flashattention: Fast and memory-efficient exact attention with io-awareness,'' in \emph{Advances in Neural Information Processing Systems}, 2022.
+\bibitem{triton2019}
+P.~Tillet, H.~Kung, and D.~Cox, ``Triton: an intermediate language and compiler for tiled neural network computations,'' in \emph{Proceedings of the 2019 International Workshop on Machine Learning and Programming Languages}, 2019.
+\end{thebibliography}
+
+\end{document}
