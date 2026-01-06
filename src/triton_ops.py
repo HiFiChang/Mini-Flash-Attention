@@ -157,10 +157,82 @@ def _fwd_kernel(
 
 
 def triton_flash_attention(q, k, v, scale=None):
+    """
+    使用Triton实现的Flash Attention（教学版本）
+    
+    这是Flash Attention算法的Triton实现，使用了Online Softmax和分块计算技术。
+    相比朴素实现，通过分块处理和重计算策略，将显存复杂度从O(N^2)降低到O(N)。
+    
+    核心优化技术:
+        1. Tiling (分块): 将Q、K、V分块加载到SRAM，减少HBM访问
+        2. Online Softmax: 逐块更新Softmax结果，避免存储完整attention矩阵
+        3. Kernel Fusion: 将QK^T、Softmax、@V融合在一个kernel中
+    
+    Args:
+        q (torch.Tensor): Query张量, shape: (B, H, L, D)
+            - B: Batch size
+            - H: Number of attention heads
+            - L: Sequence length
+            - D: Head dimension
+        k (torch.Tensor): Key张量, shape: (B, H, L, D)
+        v (torch.Tensor): Value张量, shape: (B, H, L, D)
+        scale (float, optional): 注意力分数的缩放因子，默认为1/sqrt(D)
+    
+    Returns:
+        torch.Tensor: 注意力输出, shape: (B, H, L, D)
+    
+    性能特点:
+        - 时间复杂度: O(L^2 * D) (与标准实现相同)
+        - 空间复杂度: O(L) (相比标准实现的O(L^2)大幅降低)
+        - 显存节省: 在长序列(L>2048)时可节省数倍显存
+    
+    注意事项:
+        - 该实现为教学目的，性能可能不如PyTorch官方的CUDA实现
+        - 仅实现了前向传播(Forward Pass)，未实现反向传播
+        - 数值精度使用FP16计算，FP32累加，精度略低于FP32全程计算
+    
+    Block Size选择说明:
+        - BLOCK_M=128, BLOCK_N=64 是经验值，基于以下考虑:
+          1. GPU SRAM大小限制 (通常为48-192KB)
+          2. 需要同时容纳Q_block、K_block、V_block和累加器
+          3. 对于D=64: (128*64 + 64*64 + 64*64)*2bytes ≈ 24KB < SRAM
+        - 不同GPU架构和head_dim可能需要不同的block size
+        - 更大的block可以减少循环次数，但需要更多SRAM
+    
+    参考论文:
+        FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
+        https://arxiv.org/abs/2205.14135
+    
+    示例:
+        >>> q = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
+        >>> k = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
+        >>> v = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
+        >>> output = triton_flash_attention(q, k, v)
+        >>> output.shape
+        torch.Size([2, 8, 1024, 64])
+    """
     # Shape checks
     BATCH, HEADS, N_CTX, D_HEAD = q.shape
     
-    # Define block sizes
+    # ==================== Block Size Configuration ====================
+    # BLOCK_M: Query方向的分块大小 (处理多少行Q)
+    # BLOCK_N: Key/Value方向的分块大小 (处理多少列K和V)
+    # 
+    # 选择原则:
+    # 1. SRAM容量约束: 需要同时存储 Q_block[BLOCK_M, D], K_block[D, BLOCK_N], 
+    #    V_block[BLOCK_N, D], P_block[BLOCK_M, BLOCK_N], Accumulator[BLOCK_M, D]
+    # 2. 对于A100/H100 (SM80+): SRAM ≈ 164KB，可以使用较大的block
+    # 3. 对于V100 (SM70): SRAM ≈ 96KB，需要较小的block
+    # 
+    # 当前设置 (BLOCK_M=128, BLOCK_N=64, D=64):
+    #   内存占用 ≈ (128*64 + 64*64 + 64*64 + 128*64 + 128*64) * 2 bytes
+    #           ≈ (8192 + 4096 + 4096 + 8192 + 8192) * 2
+    #           ≈ 64KB (适配大多数GPU)
+    # 
+    # 如需调优，可以尝试:
+    #   - SM80+: BLOCK_M=128, BLOCK_N=128
+    #   - SM70:  BLOCK_M=64,  BLOCK_N=64
+    # ================================================================
     BLOCK_M = 128
     BLOCK_N = 64
     
