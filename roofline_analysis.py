@@ -23,23 +23,38 @@ def get_gpu_specs():
     props = torch.cuda.get_device_properties(device)
     gpu_name = props.name
     
-    # GPU规格数据库 (理论峰值)
-    gpu_specs = {
-        # NVIDIA Data Center GPUs
-        "L20": {
-            "fp32_tflops": 59.8,    # FP32 TFLOPS
-            "fp16_tflops": 119.5,     # FP16 with Tensor Cores
-            "bandwidth_gb": 864,   # HBM2 bandwidth GB/s
-        }
+    # GPU规格数据库 (理论峰值 FP16 Tensor Cores, Bandwidth GB/s)
+    # 数据来源: NVIDIA Whitepapers
+    gpu_specs_db = {
+        "H100": {"fp16_tflops": 989.0, "bandwidth_gb": 3350}, # SXM5
+        "A100": {"fp16_tflops": 312.0, "bandwidth_gb": 1935}, # 80GB
+        "L20":  {"fp16_tflops": 119.5, "bandwidth_gb": 864},
+        "L40":  {"fp16_tflops": 181.0, "bandwidth_gb": 864},
+        "A10":  {"fp16_tflops": 125.0, "bandwidth_gb": 600},
+        "T4":   {"fp16_tflops": 65.0,  "bandwidth_gb": 320},
+        "3090": {"fp16_tflops": 71.0,  "bandwidth_gb": 936},  # Consumer
+        "4090": {"fp16_tflops": 82.6,  "bandwidth_gb": 1008}, # Consumer (Tensor Cores approx)
+        "V100": {"fp16_tflops": 125.0, "bandwidth_gb": 900},
     }
     
     # 尝试匹配GPU型号
     matched_spec = None
-    for key, spec in gpu_specs.items():
+    
+    # 1. 精确/模糊匹配
+    for key, spec in gpu_specs_db.items():
         if key.lower() in gpu_name.lower():
             matched_spec = spec.copy()
             matched_spec["name"] = gpu_name
             break
+            
+    # 2. 如果未匹配，使用默认值或根据显存猜测 (这里为了安全返回一个保守的通用值或None)
+    if matched_spec is None:
+        print(f"Warning: GPU {gpu_name} not found in database. Using generic specs.")
+        matched_spec = {
+            "name": gpu_name + " (Generic)",
+            "fp16_tflops": 100.0,
+            "bandwidth_gb": 500,
+        }
 
     return matched_spec
 
@@ -64,43 +79,45 @@ def calculate_attention_arithmetic_intensity(batch, heads, seq_len, head_dim, dt
     
     # ==================== FLOPs 计算 ====================
     # Attention公式: Softmax(Q @ K^T / sqrt(d)) @ V
+    # 忽略Softmax和Scale的微小FLOPs
     
-    # 1. Q @ K^T: [B,H,L,D] @ [B,H,D,L] = [B,H,L,L]
-    #    每个输出元素需要D次乘加 = 2D FLOPs
-    #    总共 B*H*L*L 个输出元素
+    # 1. Q @ K^T: [B,H,L,D] @ [B,H,D,L] -> [B,H,L,L]
+    #    2 * B * H * L * L * D
     qk_flops = 2 * B * H * L * L * D
     
-    # 2. Softmax: 主要是exp和sum，相对FLOPs较少，可以忽略
-    #    或简单估计为 ~5 * B*H*L*L (exp, sub, sum, div等)
-    softmax_flops = 5 * B * H * L * L
-    
-    # 3. Attn @ V: [B,H,L,L] @ [B,H,L,D] = [B,H,L,D]
-    #    每个输出元素需要L次乘加 = 2L FLOPs
-    #    总共 B*H*L*D 个输出元素
+    # 2. Attn @ V: [B,H,L,L] @ [B,H,L,D] -> [B,H,L,D]
+    #    2 * B * H * L * L * D
     av_flops = 2 * B * H * L * L * D
     
-    total_flops = qk_flops + softmax_flops + av_flops
+    # 总FLOPs (近似 4 * B * H * L^2 * D)
+    total_flops = qk_flops + av_flops
     
     # ==================== Memory Access 计算 ====================
-    # 标准实现 (Naive Attention):
-    # 需要从HBM读取: Q, K, V
-    # 需要写入HBM: QK^T矩阵, 最终输出
+    # 基础读写 (输入输出)
+    # Read Q, K, V
+    read_qkv = 3 * B * H * L * D * dtype_bytes
+    # Write Output
+    write_out = B * H * L * D * dtype_bytes
     
-    # 读取:
-    read_q = B * H * L * D * dtype_bytes
-    read_k = B * H * L * D * dtype_bytes
-    read_v = B * H * L * D * dtype_bytes
+    # --- Naive Implementation (Standard PyTorch) ---
+    # 必须显式存储中间的 Attention Matrix (Scores 和 Probabilities)
+    # 流程:
+    # 1. Read Q, K -> Compute Scores -> Write Scores (B,H,L,L)
+    # 2. Read Scores -> Softmax -> Write Probs (B,H,L,L)
+    # 3. Read Probs, V -> Compute Output -> Write Output
+    #
+    # 中间矩阵内存访问 = Write Scores + Read Scores + Write Probs + Read Probs
+    #                 = 4 * (B * H * L * L * dtype_bytes)
     
-    # 写入:
-    write_qk = B * H * L * L * dtype_bytes  # 注意力分数矩阵
-    write_output = B * H * L * D * dtype_bytes
+    intermediate_matrix_size = B * H * L * L * dtype_bytes
+    naive_intermediate_access = 4 * intermediate_matrix_size
     
-    naive_bytes = read_q + read_k + read_v + write_qk + write_output
+    naive_bytes = read_qkv + write_out + naive_intermediate_access
     
-    # Flash Attention优化后的内存访问:
-    # 通过tiling避免写入完整的QK^T矩阵
-    # 主要访问: 读Q,K,V + 写Output
-    flash_bytes = read_q + read_k + read_v + write_output
+    # --- Flash Attention Implementation ---
+    # Tiling技术：在SRAM中计算，不将L*L矩阵写回HBM
+    # 理想情况下只读Q,K,V一次，写Output一次
+    flash_bytes = read_qkv + write_out
     
     # ==================== 算术强度 ====================
     ai_naive = total_flops / naive_bytes
@@ -112,144 +129,141 @@ def calculate_attention_arithmetic_intensity(batch, heads, seq_len, head_dim, dt
         "flash_bytes": flash_bytes,
         "ai_naive": ai_naive,
         "ai_flash": ai_flash,
-        "qk_flops": qk_flops,
-        "av_flops": av_flops,
         "details": {
             "B": B, "H": H, "L": L, "D": D,
-            "read_qkv_mb": (read_q + read_k + read_v) / 1024 / 1024,
-            "write_attention_matrix_mb": write_qk / 1024 / 1024,
-            "write_output_mb": write_output / 1024 / 1024,
+            "read_qkv_mb": read_qkv / 1024**2,
+            "write_output_mb": write_out / 1024**2,
+            "naive_intermediate_mb": naive_intermediate_access / 1024**2,
         }
     }
 
 
-def plot_roofline(benchmark_results_csv, gpu_specs, output_file="roofline.pdf"):
+def plot_roofline(benchmark_results_csv, gpu_specs, batch, heads, head_dim, output_file="roofline.pdf"):
     """
     绘制Roofline图
     
     Args:
         benchmark_results_csv: benchmark结果CSV文件路径
         gpu_specs: GPU硬件规格字典
+        batch, heads, head_dim: 用于计算AI的模型配置
         output_file: 输出PDF文件名
     """
     # 读取benchmark结果
-    df = pd.read_csv(benchmark_results_csv)
-    
+    try:
+        df = pd.read_csv(benchmark_results_csv)
+    except FileNotFoundError:
+        print(f"Error: File {benchmark_results_csv} not found.")
+        return
+
     # 创建图表
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(12, 8))
     
     # GPU硬件参数
     peak_flops_fp16 = gpu_specs["fp16_tflops"]  # TFLOPS
     bandwidth = gpu_specs["bandwidth_gb"]  # GB/s
     
     # 转换为统一单位 (GFLOPS 和 GB/s)
-    peak_flops = peak_flops_fp16 * 1000  # GFLOPS
+    # y轴使用 GFLOPS
+    peak_gflops = peak_flops_fp16 * 1000  
     
     # ==================== 绘制Roofline边界 ====================
-    # 算术强度范围
-    ai_range = np.logspace(-2, 3, 100)  # 0.01 to 1000 FLOPs/Byte
+    # 算术强度范围 (扩展范围以适应不同模型)
+    ai_min = 1e-2
+    ai_max = 1e4
+    ai_range = np.logspace(np.log10(ai_min), np.log10(ai_max), 100)
     
-    # 带宽上限线: Performance = Bandwidth × AI
+    # 带宽上限线 (斜线): Performance = Bandwidth * AI
+    # Bandwidth (GB/s) * AI (FLOPs/Byte) = GFLOPS
     bandwidth_roof = bandwidth * ai_range
     
-    # 计算上限线: 常数
-    compute_roof = np.ones_like(ai_range) * peak_flops
+    # 计算上限线 (水平线)
+    compute_roof = np.ones_like(ai_range) * peak_gflops
     
-    # 实际Roofline是两者的最小值
+    # 实际Roofline
     roofline = np.minimum(bandwidth_roof, compute_roof)
     
-    # 绘制Roofline
-    ax.plot(ai_range, roofline, 'k-', linewidth=3, label='Roofline', zorder=10)
+    # 绘制
+    ax.plot(ai_range, roofline, 'k-', linewidth=2, label='Roofline Model')
     ax.fill_between(ai_range, 0, roofline, alpha=0.1, color='gray')
     
-    # 绘制边界线
-    ax.axhline(y=peak_flops, color='red', linestyle='--', 
-               linewidth=2, alpha=0.7, label=f'Peak Compute ({peak_flops_fp16} TFLOPS)')
-    
-    # 找到临界点 (ridge point)
-    ridge_ai = peak_flops / bandwidth
-    ax.axvline(x=ridge_ai, color='orange', linestyle='--', 
-               linewidth=2, alpha=0.7, label=f'Ridge Point (AI={ridge_ai:.2f})')
+    # 辅助线
+    ax.axhline(y=peak_gflops, color='r', linestyle='--', alpha=0.5, label=f'Peak Compute ({peak_flops_fp16:.1f} TFLOPS)')
+    ridge_ai = peak_gflops / bandwidth
+    ax.axvline(x=ridge_ai, color='orange', linestyle='--', alpha=0.5, label=f'Ridge Point ({ridge_ai:.1f} FLOPs/Byte)')
     
     # ==================== 绘制实验数据点 ====================
-    # 从benchmark结果中提取数据
-    # 需要计算每个测试点的AI和实际性能
+    impl_configs = [
+        {'name': 'Naive',  'color': 'red',    'marker': 'o'},
+        {'name': 'SDPA',   'color': 'orange', 'marker': 's'},
+        {'name': 'Triton', 'color': 'blue',   'marker': '^'}
+    ]
     
-    colors = {'Naive': 'red', 'SDPA': 'orange', 'Triton': 'blue'}
-    markers = {'Naive': 'o', 'SDPA': 's', 'Triton': '^'}
-    
-    # 假设配置 (应该从benchmark.py读取)
-    BATCH_SIZE = 4
-    NUM_HEADS = 8
-    HEAD_DIM = 64
-    
-    for impl in ['Naive', 'SDPA', 'Triton']:
-        ai_list = []
-        perf_list = []
+    for config in impl_configs:
+        impl = config['name']
+        perf_col = f"{impl} (TFLOPS)"
+        
+        # 检查数据是否存在
+        if perf_col not in df.columns:
+            continue
+            
+        ai_points = []
+        perf_points = []
         labels = []
         
         for _, row in df.iterrows():
-            seq_len = row['SeqLen']
+            seq_len = int(row['SeqLen'])
+            tflops = row[perf_col]
             
-            # 计算算术强度
+            if pd.isna(tflops):
+                continue
+                
+            # 计算AI
             ai_info = calculate_attention_arithmetic_intensity(
-                BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, dtype_bytes=2
+                batch, heads, seq_len, head_dim
             )
             
-            # 根据实现选择AI
+            # 确定使用的AI类型
+            # Naive使用naive_ai，SDPA和Triton实际上使用了Flash/优化算法，内存访问接近Flash AI
             if impl == 'Naive':
                 ai = ai_info['ai_naive']
-                time_ms = row.get('Naive (ms)', float('nan'))
-                tflops = row.get('Naive (TFLOPS)', float('nan'))
-            elif impl == 'SDPA':
-                ai = ai_info['ai_flash']  # SDPA使用Flash优化
-                time_ms = row.get('SDPA (ms)', float('nan'))
-                tflops = row.get('SDPA (TFLOPS)', float('nan'))
-            else:  # Triton
+            else:
                 ai = ai_info['ai_flash']
-                time_ms = row.get('Triton (ms)', float('nan'))
-                tflops = row.get('Triton (TFLOPS)', float('nan'))
             
-            # 跳过无效数据
-            if np.isnan(tflops) or np.isnan(ai):
-                continue
+            ai_points.append(ai)
+            perf_points.append(tflops * 1000) # Convert TFLOPS to GFLOPS
+            labels.append(seq_len)
             
-            ai_list.append(ai)
-            perf_list.append(tflops * 1000)  # 转换为GFLOPS
-            labels.append(f"L={seq_len}")
-        
-        # 绘制数据点
-        if ai_list:
-            ax.scatter(ai_list, perf_list, 
-                      c=colors[impl], marker=markers[impl], 
-                      s=100, alpha=0.7, label=impl, zorder=5,
-                      edgecolors='black', linewidths=1)
+        if ai_points:
+            ax.scatter(ai_points, perf_points, 
+                      c=config['color'], marker=config['marker'], s=100, 
+                      label=impl, edgecolors='k', zorder=10)
             
-            # 为每个点添加标签
-            for ai, perf, label in zip(ai_list, perf_list, labels):
-                ax.annotate(label, (ai, perf), 
-                           textcoords="offset points", 
-                           xytext=(5, 5), fontsize=8, alpha=0.7)
-    
-    # ==================== 图表设置 ====================
+            # 标注序列长度 (仅标注首尾以避免拥挤，或者针对所有点)
+            for i, txt in enumerate(labels):
+                 # 简单的防重叠逻辑：只在特定点或所有点标注
+                 ax.annotate(f"{txt}", (ai_points[i], perf_points[i]), 
+                             xytext=(0, 10), textcoords='offset points', 
+                             ha='center', fontsize=8)
+
+    # ==================== 装饰图表 ====================
     ax.set_xscale('log')
     ax.set_yscale('log')
-    ax.set_xlabel('Arithmetic Intensity (FLOPs/Byte)', fontsize=14, fontweight='bold')
-    ax.set_ylabel('Performance (GFLOPS)', fontsize=14, fontweight='bold')
-    ax.set_title(f'Roofline Model - {gpu_specs["name"]}', 
+    ax.set_xlabel('Arithmetic Intensity (FLOPs/Byte)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Performance (GFLOPS)', fontsize=12, fontweight='bold')
+    ax.set_title(f'Roofline Model - {gpu_specs["name"]}\n(B={batch}, H={heads}, D={head_dim})', 
                  fontsize=16, fontweight='bold')
     ax.grid(True, which="both", ls="-", alpha=0.3)
     ax.legend(loc='lower right', fontsize=10)
     
     # 设置坐标轴范围
-    ax.set_xlim([ai_range[0], ai_range[-1]])
-    ax.set_ylim([1, peak_flops * 1.5])
+    ax.set_xlim(ai_range[0], ai_range[-1])
+    ax.set_ylim(1, peak_gflops * 1.5)
     
     # 添加性能区域标注
-    ax.text(0.1, peak_flops * 0.3, 'Memory\nBound', 
+    ax.text(ridge_ai / 4, peak_gflops * 0.1, 'Memory\nBound', 
             fontsize=12, ha='center', va='center', 
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    ax.text(ridge_ai * 10, peak_flops * 0.8, 'Compute\nBound', 
+    ax.text(ridge_ai * 4, peak_gflops * 0.5, 'Compute\nBound', 
             fontsize=12, ha='center', va='center',
             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
     
@@ -285,11 +299,15 @@ def analyze_roofline(benchmark_results_csv, batch=4, heads=8, head_dim=64):
     print()
     
     # 读取benchmark结果
-    df = pd.read_csv(benchmark_results_csv)
+    try:
+        df = pd.read_csv(benchmark_results_csv)
+    except FileNotFoundError:
+        print(f"错误: 找不到文件 {benchmark_results_csv}")
+        return
     
     print("各序列长度的算术强度分析:")
     print("-" * 70)
-    print(f"{'SeqLen':<8} {'AI(Naive)':<12} {'AI(Flash)':<12} {'瓶颈(Naive)':<15} {'瓶颈(Flash)':<15}")
+    print(f"{'SeqLen':<8} {'AI(Naive)':<12} {'AI(Flash)':<12} {'瓶颈(Naive)':<12} {'瓶颈(Flash)':<12}")
     print("-" * 70)
     
     for _, row in df.iterrows():
@@ -302,21 +320,21 @@ def analyze_roofline(benchmark_results_csv, batch=4, heads=8, head_dim=64):
         ai_flash = ai_info['ai_flash']
         
         # 判断瓶颈
-        bottleneck_naive = "Compute Bound" if ai_naive > ridge_point else "Memory Bound"
-        bottleneck_flash = "Compute Bound" if ai_flash > ridge_point else "Memory Bound"
+        bottleneck_naive = "Compute" if ai_naive > ridge_point else "Memory"
+        bottleneck_flash = "Compute" if ai_flash > ridge_point else "Memory"
         
         print(f"{seq_len:<8} {ai_naive:<12.2f} {ai_flash:<12.2f} "
-              f"{bottleneck_naive:<15} {bottleneck_flash:<15}")
+              f"{bottleneck_naive:<12} {bottleneck_flash:<12}")
     
     print()
     print("关键观察:")
     print("  • AI < Ridge Point → Memory Bound (受带宽限制)")
     print("  • AI > Ridge Point → Compute Bound (受计算能力限制)")
-    print("  • Flash Attention提高了AI，更容易达到Compute Bound")
+    print("  • Flash Attention通过减少HBM访问提高了AI，使其更容易达到Compute Bound")
     print()
     
     # 绘制Roofline图
-    plot_roofline(benchmark_results_csv, gpu_specs)
+    plot_roofline(benchmark_results_csv, gpu_specs, batch, heads, head_dim)
     
     # 计算效率
     print("\n性能效率分析:")
