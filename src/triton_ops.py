@@ -2,6 +2,20 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
+    ],
+    key=['N_CTX', 'HEAD_DIM'],
+)
 @triton.jit
 def _fwd_kernel(
     Q, K, V, sm_scale,
@@ -29,7 +43,7 @@ def _fwd_kernel(
     """
     
     # 确保 BLOCK_N 小于或等于 HEAD_DIM，否则可能需要修改矩阵乘法逻辑 (仅作为简单的断言)
-    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    # tl.static_assert(BLOCK_N <= HEAD_DIM)
     
     # 1. 确定当前Program ID (Grid中的位置)
     # Triton会将计算网格分为多个Program，每个Program负责计算Q的一个Block
@@ -102,27 +116,25 @@ def _fwd_kernel(
         mask_n = n_range[None, :] < N_CTX
         qk = tl.where(mask_n, qk, float("-inf"))
         
-        # --- Online Softmax 更新逻辑 ---
-        # 这部分是 FlashAttention 的精髓：在不完全计算出整个 Softmax 矩阵的情况下，
-        # 逐步更新输出，大大节省显存。
+        # --- Online Softmax 更新逻辑 (FlashAttention-2 Optimize) ---
+        # 优化策略: 
+        # 1. 直接基于更新后的全局最大值 m_i_new 计算 P，避免计算 beta 和额外的乘法
+        # 2. 减少 exp 计算次数
         
         # 1. 计算当前块每行的最大值 m_ij
         m_ij = tl.max(qk, 1) # [BLOCK_M]
         
-        # 2. 计算当前块的 exp 值 (减去最大值防止溢出) P_ij
-        p = tl.exp(qk - m_ij[:, None]) # [BLOCK_M, BLOCK_N]
-        
-        # 3. 计算当前块的 row sum (l_ij)
-        l_ij = tl.sum(p, 1) # [BLOCK_M]
-        
-        # 4. 更新全局最大值 m_i_new
+        # 2. 更新全局最大值 m_i_new
         m_i_new = tl.maximum(m_i, m_ij)
         
-        # 5. 计算缩放系数 alpha 和 beta
-        # alpha用于修正之前的累加结果 acc 和 l_i (因为最大值 m_i 变了)
-        # beta用于修正当前的 exp 值 (因为我们要统一到新的全局最大值)
+        # 3. 计算缩放系数 alpha (用于修正旧的 acc 和 l_i)
+        # 如果 m_i_new == m_i (即当前块没有更大的值), 则 alpha = 1.0 (无需缩放)
         alpha = tl.exp(m_i - m_i_new)
-        beta = tl.exp(m_ij - m_i_new)
+        
+        # 4. 计算当前块的 exp 值 P_ij
+        # 直接减去新的全局最大值，这样得到的 P 已经是"Correctly Scaled"的
+        # 不需要再乘以 beta
+        p = tl.exp(qk - m_i_new[:, None])
         
         # --- 加载 V ---
         # V 需要是 [BLOCK_N, HEAD_DIM] 才能和 P [BLOCK_M, BLOCK_N] 相乘
@@ -132,16 +144,13 @@ def _fwd_kernel(
         
         # --- 更新 Accumulator ---
         
-        # 修正当前的 P，使其基于新的全局最大值
-        p_scaled = p * beta[:, None]
-        
-        # 更新累加器
-        # acc_new = acc_old * alpha + P_new @ V
+        # 更新累加器: acc_new = acc_old * alpha + P_new @ V
         acc = acc * alpha[:, None]
-        acc += tl.dot(p_scaled.to(tl.float16), v) # 使用 fp16 计算 MatMul 加速，结果累加到 fp32
+        acc += tl.dot(p.to(tl.float16), v) # 使用 fp16 计算 MatMul 加速
         
         # 更新全局 l_i (分母)
-        l_i = l_i * alpha + l_ij * beta
+        # l_new = l_old * alpha + sum(P_new)
+        l_i = l_i * alpha + tl.sum(p, 1)
         
         # 更新 m_i 为下一轮做准备
         m_i = m_i_new
@@ -218,23 +227,8 @@ def triton_flash_attention(q, k, v, scale=None):
     # BLOCK_M: Query方向的分块大小 (处理多少行Q)
     # BLOCK_N: Key/Value方向的分块大小 (处理多少列K和V)
     # 
-    # 选择原则:
-    # 1. SRAM容量约束: 需要同时存储 Q_block[BLOCK_M, D], K_block[D, BLOCK_N], 
-    #    V_block[BLOCK_N, D], P_block[BLOCK_M, BLOCK_N], Accumulator[BLOCK_M, D]
-    # 2. 对于A100/H100 (SM80+): SRAM ≈ 164KB，可以使用较大的block
-    # 3. 对于V100 (SM70): SRAM ≈ 96KB，需要较小的block
-    # 
-    # 当前设置 (BLOCK_M=128, BLOCK_N=64, D=64):
-    #   内存占用 ≈ (128*64 + 64*64 + 64*64 + 128*64 + 128*64) * 2 bytes
-    #           ≈ (8192 + 4096 + 4096 + 8192 + 8192) * 2
-    #           ≈ 64KB (适配大多数GPU)
-    # 
-    # 如需调优，可以尝试:
-    #   - SM80+: BLOCK_M=128, BLOCK_N=128
-    #   - SM70:  BLOCK_M=64,  BLOCK_N=64
+    # 注意: 现在使用 Triton Autotune 自动选择最佳 Block Size 和 Warps 配置
     # ================================================================
-    BLOCK_M = 128
-    BLOCK_N = 64
     
     # Output buffer
     o = torch.empty_like(q)
@@ -242,14 +236,12 @@ def triton_flash_attention(q, k, v, scale=None):
     # Grid
     # we launch grid along M axis (rows of Q)
     # and Batch*Heads axis
-    grid = (triton.cdiv(N_CTX, BLOCK_M), BATCH * HEADS)
+    # The autotuner passes META so we can access BLOCK_M
+    grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_M']), BATCH * HEADS)
     
     if scale is None:
         scale = 1.0 / (D_HEAD ** 0.5)
         
-    num_stages = 4 if torch.cuda.get_device_properties(0).major >= 8 else 3
-    num_warps = 4
-    
     _fwd_kernel[grid](
         q, k, v, scale,
         None, None, # L, M not used
@@ -259,9 +251,196 @@ def triton_flash_attention(q, k, v, scale=None):
         v.stride(0), v.stride(1), v.stride(2), v.stride(3),
         o.stride(0), o.stride(1), o.stride(2), o.stride(3),
         BATCH, HEADS, N_CTX,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D_HEAD,
-        num_warps=num_warps,
-        num_stages=num_stages
+        HEAD_DIM=D_HEAD
     )
     
+    return o
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=4, num_warps=8),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=4, num_warps=4),
+    ],
+    key=['N_CTX', 'HEAD_DIM'],
+)
+@triton.jit
+def _fwd_kernel_v2(
+    Q, K, V, sm_scale,
+    Out,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_on,
+    Z, H, N_CTX,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr
+):
+    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+
+    # Offsets for memory pointers
+    q_offset = off_hz * stride_qh
+    k_offset = off_hz * stride_kh
+    v_offset = off_hz * stride_vh
+    o_offset = off_hz * stride_oh
+
+    # -----------------------------------------------------------
+    # Block Pointers (Triton 2.0+)
+    # -----------------------------------------------------------
+    
+    # Q Block Ptr
+    # Shape: (N_CTX, HEAD_DIM)
+    # Block: (BLOCK_M, HEAD_DIM)
+    # Start: (start_m * BLOCK_M, 0)
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + q_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0)
+    )
+
+    # K Block Ptr
+    # Shape: (HEAD_DIM, N_CTX) -- Transposed View for easier dot
+    # Actually, keep (N_CTX, HEAD_DIM) and load, then transpose in registers
+    # Because make_block_ptr order refers to memory layout
+    # Memory: (N_CTX, HEAD_DIM) with stride (stride_kn, stride_kk)
+    K_block_ptr = tl.make_block_ptr(
+        base=K + k_offset,
+        shape=(HEAD_DIM, N_CTX),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(HEAD_DIM, BLOCK_N),
+        order=(0, 1)
+    )
+    
+    # V Block Ptr
+    # Shape: (N_CTX, HEAD_DIM)
+    V_block_ptr = tl.make_block_ptr(
+        base=V + v_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, HEAD_DIM),
+        order=(1, 0)
+    )
+    
+    # O Block Ptr
+    O_block_ptr = tl.make_block_ptr(
+        base=Out + o_offset,
+        shape=(N_CTX, HEAD_DIM),
+        strides=(stride_om, stride_on),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, HEAD_DIM),
+        order=(1, 0)
+    )
+
+    # Initialize accumulators
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    
+    # Load Q
+    # boundary_check=(0,): only check dim 0 (M)
+    q = tl.load(Q_block_ptr, boundary_check=(0,), padding_option="zero")
+    
+    # Loop over K, V blocks
+    for start_n in range(0, N_CTX, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        
+        # Load K, V
+        # K shape logic: 
+        # We constructed K_ptr as (HEAD_DIM, N_CTX)
+        # block_shape=(HEAD_DIM, BLOCK_N)
+        # so k is (HEAD_DIM, BLOCK_N) -> ready for dot(q, k)
+        k = tl.load(K_block_ptr, boundary_check=(1,), padding_option="zero")
+        
+        v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
+        
+        # QK^T
+        qk = tl.dot(q, k)
+        qk *= sm_scale
+        
+        # Masking (General/Padding checks if needed)
+        # With block pointers, if padding_option="zero", k/v are 0 outside.
+        # But for Softmax, we need -inf for masked positions.
+        # The block pointer handles reading 0s. 
+        # But we computed qk with zeros. exp(0) = 1. This affects softmax!
+        # So we explicitly need a geometric mask for the columns.
+        
+        # Reconstruct ranges for masking
+        # It's slightly redundant but needed for correctness with make_block_ptr
+        # if implicit masking is zero-padding.
+        # (Though if K was 0, dot product is 0. masked_fill needs -inf)
+        
+        # Explicit mask construction
+        # (Alternatively, create a mask tensor)
+        # For simplicity, we can do:
+        if start_n + BLOCK_N > N_CTX:
+             # Handle edge case for last block
+             # (Only needed if N_CTX is not multiple of BLOCK_N)
+             n_range = start_n + tl.arange(0, BLOCK_N)
+             mask_n = n_range[None, :] < N_CTX
+             qk = tl.where(mask_n, qk, float("-inf"))
+        
+        # Online Softmax updates - same as V1
+        m_ij = tl.max(qk, 1)
+        p = tl.exp(qk - m_ij[:, None])
+        l_ij = tl.sum(p, 1)
+        
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        beta = tl.exp(m_ij - m_i_new)
+        
+        acc = acc * alpha[:, None]
+        p_scaled = p * beta[:, None]
+        acc += tl.dot(p_scaled.to(tl.float16), v)
+        
+        l_i = l_i * alpha + l_ij * beta
+        m_i = m_i_new
+        
+        # Advance pointers
+        # K: advance along N_CTX (dim 1)
+        # V: advance along N_CTX (dim 0)
+        tl.advance(K_block_ptr, (0, BLOCK_N))
+        tl.advance(V_block_ptr, (BLOCK_N, 0))
+
+    # Epilogue
+    acc = acc / l_i[:, None]
+    tl.store(O_block_ptr, acc.to(tl.float16), boundary_check=(0,))
+
+def triton_flash_attention_v2(q, k, v, scale=None):
+    """
+    Flash Attention V2 (Triton Block Pointers)
+    """
+    BATCH, HEADS, N_CTX, D_HEAD = q.shape
+    
+    # Grid
+    grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_M']), BATCH * HEADS)
+    
+    if scale is None:
+        scale = 1.0 / (D_HEAD ** 0.5)
+        
+    o = torch.empty_like(q)
+    
+    _fwd_kernel_v2[grid](
+        q, k, v, scale,
+        o,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+        BATCH, HEADS, N_CTX,
+        HEAD_DIM=D_HEAD
+    )
     return o

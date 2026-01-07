@@ -168,7 +168,7 @@ def plot_roofline(benchmark_results_csv, gpu_specs, batch, heads, head_dim, outp
     
     # ==================== 绘制Roofline边界 ====================
     # 算术强度范围 (扩展范围以适应不同模型)
-    ai_min = 1e-2
+    ai_min = 1e1
     ai_max = 1e4
     ai_range = np.logspace(np.log10(ai_min), np.log10(ai_max), 100)
     

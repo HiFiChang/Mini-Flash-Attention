@@ -28,6 +28,9 @@ SEQ_LENS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 WARMUP = 5      # 预热次数，确保GPU达到稳定状态
 REPEATS = 100   # 重复测试次数，提高测量精度
 
+# Compiled Naive Attention
+naive_attention_compiled = torch.compile(naive_attention)
+
 def benchmark_op(op, q, k, v):
     """
     Benchmark using Triton's standardized testing utility.
@@ -111,6 +114,16 @@ def main():
                 time_naive = float('nan')
                 torch.cuda.empty_cache()
 
+            # 1.5 Naive PyTorch (Compiled)
+            # 预热编译
+            try:
+                mem_compiled = benchmark_memory(naive_attention_compiled, q, k, v)
+                time_compiled = benchmark_op(naive_attention_compiled, q, k, v)
+            except torch.cuda.OutOfMemoryError:
+                mem_compiled = float('nan')
+                time_compiled = float('nan')
+                torch.cuda.empty_cache()
+
             # 2. PyTorch SDPA (Flash/MemEfficient)
             time_sdpa = benchmark_op(pytorch_sdpa_attention, q, k, v)
             mem_sdpa = benchmark_memory(pytorch_sdpa_attention, q, k, v)
@@ -142,18 +155,22 @@ def main():
             # 计算吞吐量指标
             total_flops = calculate_flops(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM)
             throughput_naive = calculate_throughput(total_flops, time_naive)
+            throughput_compiled = calculate_throughput(total_flops, time_compiled)
             throughput_sdpa = calculate_throughput(total_flops, time_sdpa)
             throughput_triton = calculate_throughput(total_flops, time_triton)
             
             results.append({
                 "SeqLen": seq_len,
                 "Naive (ms)": time_naive,
+                "Compiled (ms)": time_compiled,
                 "SDPA (ms)": time_sdpa,
                 "Triton (ms)": time_triton,
                 "Naive (MB)": mem_naive,
+                # "Compiled (MB)": mem_compiled, # 暂不显示，为了表格整洁
                 "SDPA (MB)": mem_sdpa,
                 "Triton (MB)": mem_triton,
                 "Naive (TFLOPS)": throughput_naive,
+                "Compiled (TFLOPS)": throughput_compiled,
                 "SDPA (TFLOPS)": throughput_sdpa,
                 "Triton (TFLOPS)": throughput_triton,
                 "Speedup vs Naive": time_naive / time_triton if time_naive == time_naive else float('inf'),
