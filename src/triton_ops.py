@@ -163,98 +163,279 @@ def _fwd_kernel(
     # 构造输出指针
     O_block_ptr = Out + o_offset + (m_range[:, None] * stride_om) + (d_range[None, :] * stride_on)
     tl.store(O_block_ptr, acc.to(tl.float16), mask=m_range[:, None] < N_CTX)
+    
+    # 8. 写入 LogSumExp (L) 用于反向传播
+    # L = m_i + log(l_i)
+    # L shape: (B, H, N_CTX) -> Pointer arithmetic assuming contiguous in last dim or similar structure
+    # 这里我们假设 L 是 (B, H, N_CTX) 的布局
+    # 指针地址: L_base + (off_hz * N_CTX) + m_range
+    # 注意：为了简化，我们这里假设 L 是连续的 (B*H, N_CTX)
+    L_block_ptr = L + off_hz * N_CTX + m_range
+    l_i_log = m_i + tl.log(l_i)
+    tl.store(L_block_ptr, l_i_log, mask=m_range < N_CTX)
 
+
+@triton.jit
+def _bwd_preprocess(
+    Out, DO,
+    Delta,
+    BLOCK_M: tl.constexpr, D_HEAD: tl.constexpr,
+):
+    """
+    计算 Delta = sum(Out * DO, axis=-1)
+    这是 FlashAttention 反向传播公式中的修正项
+    dS_ij = P_ij * (dP_ij - Delta_i)
+    """
+    off_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    off_n = tl.arange(0, D_HEAD)
+    # Load Out and DO
+    # Assume contiguous layout for simplicity or use strides if passed (here assuming generic pointer math handles it roughly)
+    # Ideally should pass strides, but for preprocessing we can assume simple layout or just pointer arithmetic
+    # For robust implementation, we strictly follow grid
+    
+    # Grid: (N_CTX // BLOCK_M, B * H)
+    # But for simplicity, let's treat pointers as flattened (B*H*N_CTX, D)
+    
+    # 实际上由于 Delta 需要与 Forward 的 loop 对应，我们让 grid 为 (N_CTX // BLOCK_M * B * H)
+    # 所以 off_m 就是绝对的 row index
+    
+    o = tl.load(Out + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    do = tl.load(DO + off_m[:, None] * D_HEAD + off_n[None, :]).to(tl.float32)
+    
+    delta = tl.sum(o * do, axis=1)
+    
+    tl.store(Delta + off_m, delta)
+
+@triton.jit
+def _bwd_kernel(
+    Q, K, V, sm_scale,
+    Out, DO,
+    DQ, DK, DV,
+    L,
+    D,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    num_head, seq_len_ctx,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr
+):
+    """
+    Flash Attention Backward Kernel
+    
+    策略:
+    - Parallelize over K/V blocks (Axis 0) to avoid atomic locks on DK, DV
+    - Loop over Q blocks (Inner loop) and use atomic_add for DQ
+    """
+    # Grid: (N_CTX // BLOCK_N, B * H)
+    off_n = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N) # K, V range
+    off_hz = tl.program_id(1) # Batch * Head
+    
+    # Offsets for current batch/head
+    q_offset = off_hz * stride_qh
+    k_offset = off_hz * stride_kh
+    v_offset = off_hz * stride_vh
+    o_offset = off_hz * seq_len_ctx * HEAD_DIM # Assuming contiguous OUT
+    do_offset = o_offset
+    dq_offset = q_offset
+    dk_offset = k_offset
+    dv_offset = v_offset
+    
+    # Pointers to K, V (fixed for this program)
+    k_ptrs = K + k_offset + (off_n[:, None] * stride_kn) + (tl.arange(0, HEAD_DIM)[None, :] * stride_kk)
+    v_ptrs = V + v_offset + (off_n[:, None] * stride_vn) + (tl.arange(0, HEAD_DIM)[None, :] * stride_vk)
+    
+    # Accumulators for DK, DV
+    dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+    
+    # Load K and V
+    # mask checks
+    k = tl.load(k_ptrs, mask=off_n[:, None] < seq_len_ctx, other=0.0)
+    v = tl.load(v_ptrs, mask=off_n[:, None] < seq_len_ctx, other=0.0)
+    
+    # Loop over Q blocks (M dimension)
+    # We iterate through all Q blocks that attend to these K/V blocks
+    # Attention is fully causal or non-causal. Here we assume non-causal (standard)
+    # For M loop:
+    for start_m in range(0, seq_len_ctx, BLOCK_M):
+        off_m = start_m + tl.arange(0, BLOCK_M)
+        
+        # Load Q
+        q_ptrs = Q + q_offset + (off_m[:, None] * stride_qm) + (tl.arange(0, HEAD_DIM)[None, :] * stride_qk)
+        q = tl.load(q_ptrs, mask=off_m[:, None] < seq_len_ctx, other=0.0)
+        
+        # Compute QK^T (Attention Scores)
+        # q: [BLOCK_M, HEAD_DIM], k: [BLOCK_N, HEAD_DIM] -> qk: [BLOCK_M, BLOCK_N]
+        # Transpose k for dot product
+        qk = tl.dot(q, tl.trans(k))
+        qk *= sm_scale
+        
+        # Load L (LogSumExp)
+        # L ptr: off_hz * seq_len + off_m
+        l = tl.load(L + off_hz * seq_len_ctx + off_m, mask=off_m < seq_len_ctx, other=0.0)
+        
+        # Recompute P (Softmax)
+        # p = exp(qk - l_i)
+        p = tl.exp(qk - l[:, None])
+        
+        # Mask out padding/invalid (if any)
+        # Note: In forward we masked qk. Here we mask p.
+        p = tl.where((off_m[:, None] < seq_len_ctx) & (off_n[None, :] < seq_len_ctx), p, 0.0)
+        
+        # Load DO
+        do_ptrs = DO + do_offset + (off_m[:, None] * HEAD_DIM) + (tl.arange(0, HEAD_DIM)[None, :])
+        do = tl.load(do_ptrs, mask=off_m[:, None] < seq_len_ctx, other=0.0)
+        
+        # Load Delta
+        # Delta ptr: off_hz * seq_len + off_m
+        delta = tl.load(D + off_hz * seq_len_ctx + off_m, mask=off_m < seq_len_ctx, other=0.0)
+        
+        # Compute dP
+        # dP = dot(DO, V^T)
+        # DO: [BLOCK_M, HEAD_DIM], V: [BLOCK_N, HEAD_DIM] -> dp: [BLOCK_M, BLOCK_N]
+        dp = tl.dot(do, tl.trans(v))
+        
+        # Compute dS (Gradient w.r.t Attention Scores)
+        # dS = P * (dP - Delta)
+        # dS = P * dP - P * Delta
+        ds = p * (dp - delta[:, None])
+        ds = ds.to(tl.float16) * sm_scale # Scale gradient
+        
+        # Accumulate DV
+        # dV += P^T @ DO
+        # P^T: [BLOCK_N, BLOCK_M], DO: [BLOCK_M, HEAD_DIM]
+        dv += tl.dot(tl.trans(p.to(tl.float16)), do)
+        
+        # Accumulate DK
+        # dK += dS^T @ Q
+        # dS^T: [BLOCK_N, BLOCK_M], Q: [BLOCK_M, HEAD_DIM]
+        dk += tl.dot(tl.trans(ds.to(tl.float16)), q)
+        
+        # Accumulate DQ (Atomic Add necessary as multiple K blocks contribute to same Q)
+        # dQ += dS @ K
+        # dS: [BLOCK_M, BLOCK_N], K: [BLOCK_N, HEAD_DIM]
+        # Wait, inside this loop we only compute contribution from current K block to current Q block.
+        # We need to atomic_add this contribution to global DQ memory.
+        dq = tl.dot(ds.to(tl.float16), k)
+        
+        dq_ptrs = DQ + dq_offset + (off_m[:, None] * stride_qm) + (tl.arange(0, HEAD_DIM)[None, :] * stride_qk)
+        tl.atomic_add(dq_ptrs, dq, mask=off_m[:, None] < seq_len_ctx)
+        
+    # Store DK, DV
+    # These are exclusive to this program/block, so no atomics needed
+    dk_ptrs = DK + dk_offset + (off_n[:, None] * stride_kn) + (tl.arange(0, HEAD_DIM)[None, :] * stride_kk)
+    tl.store(dk_ptrs, dk.to(tl.float16), mask=off_n[:, None] < seq_len_ctx)
+    
+    dv_ptrs = DV + dv_offset + (off_n[:, None] * stride_vn) + (tl.arange(0, HEAD_DIM)[None, :] * stride_vk)
+    tl.store(dv_ptrs, dv.to(tl.float16), mask=off_n[:, None] < seq_len_ctx)
+
+
+class FlashAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, scale=None):
+        # Shape checks
+        BATCH, HEADS, N_CTX, D_HEAD = q.shape
+    
+        # Default scale
+        if scale is None:
+            scale = 1.0 / (D_HEAD ** 0.5)
+            
+        # 1. Output buffers
+        o = torch.empty_like(q)
+        # LogSumExp buffer for backward pass
+        # Shape: (B, H, N_CTX)
+        # We ensure it's contiguous for simple pointer math
+        L = torch.empty((BATCH, HEADS, N_CTX), device=q.device, dtype=torch.float32)
+        
+        # 2. Kernel launch parameters
+        # Autotune handles BLOCK_M/BLOCK_N
+        
+        grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_M']), BATCH * HEADS)
+        
+        _fwd_kernel[grid](
+            q, k, v, scale,
+            L, None, # L passed here
+            o,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            BATCH, HEADS, N_CTX,
+            HEAD_DIM=D_HEAD
+        )
+        
+        # Save for backward
+        ctx.save_for_backward(q, k, v, o, L)
+        ctx.scale = scale
+        ctx.BLOCK_M = 128 # Default or from autotune? Best to hardcode consistent block size for bwd or use heuristics
+        # Note: Backward often works better with specific block sizes (e.g. 128)
+        # For simplicity in this demo, we assume consistent configs or basic configs for backward
+        
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, L = ctx.saved_tensors
+        scale = ctx.scale
+        
+        BATCH, HEADS, N_CTX, D_HEAD = q.shape
+        
+        # 1. Preprocess: Compute Delta = sum(do * o, dim=-1)
+        delta = torch.empty_like(L)
+        
+        # Use simple heuristics for preprocess grid
+        # We can reuse similar block size or just 128
+        PRE_BLOCK_M = 128
+        grid_pre = (triton.cdiv(N_CTX, PRE_BLOCK_M) * BATCH * HEADS, )
+        
+        _bwd_preprocess[grid_pre](
+            o, do,
+            delta,
+            BLOCK_M=PRE_BLOCK_M, D_HEAD=D_HEAD
+        )
+        
+        # 2. Backward Kernel
+        dq = torch.zeros_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        
+        # Config for bwd kernel
+        # We process K/V in blocks of BLOCK_N (grid dimension)
+        # We loop over Q inside
+        # Empirically, BLOCK_N=64, BLOCK_M=64 works robustly
+        BLOCK_M = 64
+        BLOCK_N = 64 
+        num_stages = 3
+        num_warps = 4
+        
+        grid_bwd = (triton.cdiv(N_CTX, BLOCK_N), BATCH * HEADS)
+        
+        _bwd_kernel[grid_bwd](
+            q, k, v, scale,
+            o, do,
+            dq, dk, dv,
+            L, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            HEADS, N_CTX,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D_HEAD,
+            num_warps=num_warps,
+            num_stages=num_stages
+        )
+        
+        return dq, dk, dv, None
 
 def triton_flash_attention(q, k, v, scale=None):
     """
-    使用Triton实现的Flash Attention（教学版本）
-    
-    这是Flash Attention算法的Triton实现，使用了Online Softmax和分块计算技术。
-    相比朴素实现，通过分块处理和重计算策略，将显存复杂度从O(N^2)降低到O(N)。
-    
-    核心优化技术:
-        1. Tiling (分块): 将Q、K、V分块加载到SRAM，减少HBM访问
-        2. Online Softmax: 逐块更新Softmax结果，避免存储完整attention矩阵
-        3. Kernel Fusion: 将QK^T、Softmax、@V融合在一个kernel中
-    
-    Args:
-        q (torch.Tensor): Query张量, shape: (B, H, L, D)
-            - B: Batch size
-            - H: Number of attention heads
-            - L: Sequence length
-            - D: Head dimension
-        k (torch.Tensor): Key张量, shape: (B, H, L, D)
-        v (torch.Tensor): Value张量, shape: (B, H, L, D)
-        scale (float, optional): 注意力分数的缩放因子，默认为1/sqrt(D)
-    
-    Returns:
-        torch.Tensor: 注意力输出, shape: (B, H, L, D)
-    
-    性能特点:
-        - 时间复杂度: O(L^2 * D) (与标准实现相同)
-        - 空间复杂度: O(L) (相比标准实现的O(L^2)大幅降低)
-        - 显存节省: 在长序列(L>2048)时可节省数倍显存
-    
-    注意事项:
-        - 该实现为教学目的，性能可能不如PyTorch官方的CUDA实现
-        - 仅实现了前向传播(Forward Pass)，未实现反向传播
-        - 数值精度使用FP16计算，FP32累加，精度略低于FP32全程计算
-    
-    Block Size选择说明:
-        - BLOCK_M=128, BLOCK_N=64 是经验值，基于以下考虑:
-          1. GPU SRAM大小限制 (通常为48-192KB)
-          2. 需要同时容纳Q_block、K_block、V_block和累加器
-          3. 对于D=64: (128*64 + 64*64 + 64*64)*2bytes ≈ 24KB < SRAM
-        - 不同GPU架构和head_dim可能需要不同的block size
-        - 更大的block可以减少循环次数，但需要更多SRAM
-    
-    参考论文:
-        FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness
-        https://arxiv.org/abs/2205.14135
-    
-    示例:
-        >>> q = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
-        >>> k = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
-        >>> v = torch.randn(2, 8, 1024, 64, device='cuda', dtype=torch.float16)
-        >>> output = triton_flash_attention(q, k, v)
-        >>> output.shape
-        torch.Size([2, 8, 1024, 64])
+    使用Triton实现的Flash Attention（Forward + Backward）
     """
-    # Shape checks
-    BATCH, HEADS, N_CTX, D_HEAD = q.shape
-    
-    # ==================== Block Size Configuration ====================
-    # BLOCK_M: Query方向的分块大小 (处理多少行Q)
-    # BLOCK_N: Key/Value方向的分块大小 (处理多少列K和V)
-    # 
-    # 注意: 现在使用 Triton Autotune 自动选择最佳 Block Size 和 Warps 配置
-    # ================================================================
-    
-    # Output buffer
-    o = torch.empty_like(q)
-    
-    # Grid
-    # we launch grid along M axis (rows of Q)
-    # and Batch*Heads axis
-    # The autotuner passes META so we can access BLOCK_M
-    grid = lambda META: (triton.cdiv(N_CTX, META['BLOCK_M']), BATCH * HEADS)
-    
-    if scale is None:
-        scale = 1.0 / (D_HEAD ** 0.5)
-        
-    _fwd_kernel[grid](
-        q, k, v, scale,
-        None, None, # L, M not used
-        o,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        BATCH, HEADS, N_CTX,
-        HEAD_DIM=D_HEAD
-    )
-    
-    return o
+    return FlashAttention.apply(q, k, v, scale)
+
+# Legacy / Unused code removed
+# def _old_triton_flash_attention(q, k, v, scale=None):
+#     pass
 
 @triton.autotune(
     configs=[

@@ -31,35 +31,76 @@ REPEATS = 100   # 重复测试次数，提高测量精度
 # Compiled Naive Attention
 naive_attention_compiled = torch.compile(naive_attention)
 
-def benchmark_op(op, q, k, v):
+def benchmark_op(op, q, k, v, requires_grad=False):
     """
     Benchmark using Triton's standardized testing utility.
     """
-    return triton.testing.do_bench(lambda: op(q, k, v), warmup=WARMUP, rep=REPEATS)
+    if requires_grad:
+        # Benchmark Forward + Backward
+        def fwd_bwd_op():
+            # Need to clone or recreate inputs if they are modified inplace, but attention usually isn't
+            # We need to reset grads
+            if q.grad is not None:
+                q.grad = None
+            if k.grad is not None:
+                k.grad = None
+            if v.grad is not None:
+                v.grad = None
+                
+            out = op(q, k, v)
+            loss = out.mean() # Hacky scalar loss
+            loss.backward()
+            
+        return triton.testing.do_bench(fwd_bwd_op, warmup=WARMUP, rep=REPEATS)
+    else:
+        # Benchmark Forward Only
+        return triton.testing.do_bench(lambda: op(q, k, v), warmup=WARMUP, rep=REPEATS)
 
-def benchmark_memory(op, q, k, v):
+def benchmark_memory(op, q, k, v, requires_grad=False):
     """测量操作的峰值显存占用"""
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     try:
-        op(q, k, v)
+        if requires_grad:
+            out = op(q, k, v)
+            loss = out.mean()
+            loss.backward()
+        else:
+            op(q, k, v)
         mem = torch.cuda.max_memory_allocated() / 1024 / 1024 # MB
     except torch.cuda.OutOfMemoryError:
         mem = float('nan')
     torch.cuda.empty_cache()
     return mem
 
-def calculate_flops(batch, heads, seq_len, head_dim):
+def calculate_flops(batch, heads, seq_len, head_dim, backward=False):
     """
-    计算标准Attention的理论FLOPS数
+    计算Attention的理论FLOPS数
     
-    Attention计算流程:
-    1. Q @ K^T: (B*H*L*D) @ (B*H*D*L) = B*H*L*L*D 次乘加 = 2*B*H*L^2*D FLOPs
-    2. Softmax: 主要是exp和sum，忽略不计
-    3. Attn @ V: (B*H*L*L) @ (B*H*L*D) = 2*B*H*L^2*D FLOPs
-    总计: 4*B*H*L^2*D FLOPs
+    精确计算:
+    Forward GEMMs:
+      1. Q @ K^T: 2 * B * H * L^2 * D
+      2. P @ V:   2 * B * H * L^2 * D
+      Total Forward = 4 * B * H * L^2 * D
+      
+    Backward GEMMs (Standard Backprop):
+      1. dV = P^T @ dO:  2 * B * H * L^2 * D
+      2. dP = dO @ V^T:  2 * B * H * L^2 * D
+      3. dQ = dS @ K:    2 * B * H * L^2 * D
+      4. dK = dS^T @ Q:  2 * B * H * L^2 * D
+      Total Backward = 8 * B * H * L^2 * D
+    
+    Total Training (Fwd + Bwd) = 12 * B * H * L^2 * D
+    
+    注意: FlashAttention引入了重计算(Recomputation)，实际上会多做一次Forward (4*...),
+    也就是实际计算量为 16 * ..., 但为了公平对比Throughput(有效吞吐),
+    我们通常使用理论最小计算量 (12x) 或 包含检查点开销的标准量.
+    这里我们采用理论值: Forward=4N^2d, Training=12N^2d (1:3比例).
     """
-    return 4 * batch * heads * seq_len * seq_len * head_dim
+    fwd_flops = 4 * batch * heads * seq_len * seq_len * head_dim
+    if backward:
+        return 3.0 * fwd_flops # Fwd(1) + Bwd(2) = 3x total
+    return fwd_flops
 
 def calculate_throughput(flops, time_ms):
     """
@@ -94,101 +135,124 @@ def main():
         
         # Prepare inputs (random data)
         # Shape: (B, H, L, D)
-        q = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float16)
-        k = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float16)
-        v = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float16)
+        # For training benchmark, we need gradients
+        q = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float16, requires_grad=True)
+        k = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float16, requires_grad=True)
+        v = torch.randn(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float16, requires_grad=True)
         
         try:
-            # 1. Naive PyTorch
+            # 1. Forward Pass Benchmarks
+            # --------------------------------------------------------------------------------
+            # Naive PyTorch (Compiled)
             try:
-                # 显存测试 (跑一次) - 优先运行，不容易 OOM
-                mem_naive = benchmark_memory(naive_attention, q, k, v)
-            except torch.cuda.OutOfMemoryError:
-                mem_naive = float('nan')
-                torch.cuda.empty_cache()
+                if seq_len <= 4096:
+                    time_compiled_fwd = benchmark_op(naive_attention_compiled, q, k, v, requires_grad=False)
+                else:
+                    time_compiled_fwd = float('nan')
+            except Exception:
+                time_compiled_fwd = float('nan')
 
-            try:
-                # 速度测试 (跑多次) - 容易因碎片化 OOM
-                time_naive = benchmark_op(naive_attention, q, k, v)
-            except torch.cuda.OutOfMemoryError:
-                time_naive = float('nan')
-                torch.cuda.empty_cache()
+            # PyTorch SDPA
+            time_sdpa_fwd = benchmark_op(pytorch_sdpa_attention, q, k, v, requires_grad=False)
 
-            # 1.5 Naive PyTorch (Compiled)
-            # 预热编译
-            try:
-                mem_compiled = benchmark_memory(naive_attention_compiled, q, k, v)
-                time_compiled = benchmark_op(naive_attention_compiled, q, k, v)
-            except torch.cuda.OutOfMemoryError:
-                mem_compiled = float('nan')
-                time_compiled = float('nan')
-                torch.cuda.empty_cache()
-
-            # 2. PyTorch SDPA (Flash/MemEfficient)
-            time_sdpa = benchmark_op(pytorch_sdpa_attention, q, k, v)
-            mem_sdpa = benchmark_memory(pytorch_sdpa_attention, q, k, v)
-
-            # 3. Triton Flash Attention
-            time_triton = benchmark_op(triton_flash_attention, q, k, v)
-            mem_triton = benchmark_memory(triton_flash_attention, q, k, v)
+            # Triton Flash Attention
+            time_triton_fwd = benchmark_op(triton_flash_attention, q, k, v, requires_grad=False)
             
-            # Verify correctness (使用更严格的相对误差检查)
+            
+            # 2. Combined (Forward + Backward) Benchmarks
+            # --------------------------------------------------------------------------------
+            
+            # PyTorch SDPA (Backward)
+            time_sdpa_bwd = benchmark_op(pytorch_sdpa_attention, q, k, v, requires_grad=True)
+            mem_sdpa_bwd = benchmark_memory(pytorch_sdpa_attention, q, k, v, requires_grad=True)
+            
+            # Triton Flash Attention (Backward)
+            time_triton_bwd = benchmark_op(triton_flash_attention, q, k, v, requires_grad=True)
+            mem_triton_bwd = benchmark_memory(triton_flash_attention, q, k, v, requires_grad=True)
+            
+            
+            # 3. Naive & Compiled Combined
+            # --------------------------------------------------------------------------------
+            # Naive Eager Backward
             if seq_len <= 1024:
-                ref_out = pytorch_sdpa_attention(q, k, v)
-                triton_out = triton_flash_attention(q, k, v)
-                
-                # 使用torch.allclose进行正确性验证
-                # atol=1e-2: 绝对误差容忍度 (考虑到FP16精度)
-                # rtol=1e-3: 相对误差容忍度
-                is_correct = torch.allclose(ref_out, triton_out, atol=1e-2, rtol=1e-3)
-                max_diff = torch.abs(ref_out - triton_out).max().item()
-                mean_diff = torch.abs(ref_out - triton_out).mean().item()
-                
-                print(f"Correctness Check for L={seq_len}:")
-                print(f"  Max Diff: {max_diff:.6f}, Mean Diff: {mean_diff:.6f}")
-                print(f"  Result: {'✓ PASS' if is_correct else '✗ FAIL'}")
-                
-                if not is_correct:
-                    print(f"  WARNING: Numerical accuracy issue detected!")
-                    print(f"  This may be due to FP16 precision or implementation differences.")
+                try:
+                    time_naive_bwd = benchmark_op(naive_attention, q, k, v, requires_grad=True)
+                except Exception:
+                    time_naive_bwd = float('nan')
+            else:
+                time_naive_bwd = float('nan')
 
-            # 计算吞吐量指标
-            total_flops = calculate_flops(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM)
-            throughput_naive = calculate_throughput(total_flops, time_naive)
-            throughput_compiled = calculate_throughput(total_flops, time_compiled)
-            throughput_sdpa = calculate_throughput(total_flops, time_sdpa)
-            throughput_triton = calculate_throughput(total_flops, time_triton)
+            # Naive Compiled Backward
+            if seq_len <= 1024:
+                try:
+                    time_compiled_bwd = benchmark_op(naive_attention_compiled, q, k, v, requires_grad=True)
+                except Exception:
+                    time_compiled_bwd = float('nan')
+            else:
+                time_compiled_bwd = float('nan')
+
+            # Verify correctness (Forward only for simplicity in this loop, backward verified separately)
+            if seq_len <= 1024:
+                with torch.no_grad():
+                     ref_out = pytorch_sdpa_attention(q, k, v)
+                     triton_out = triton_flash_attention(q, k, v)
+                     is_correct = torch.allclose(ref_out, triton_out, atol=1e-2, rtol=1e-3)
+                     if not is_correct:
+                        print(f"  WARNING: Numerical accuracy issue detected!")
+
+            # 计算吞吐量指标 (Using Fwd+Bwd FLOPs for Combined times)
+            flop_fwd = calculate_flops(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, backward=False)
+            flop_bwd = calculate_flops(BATCH_SIZE, NUM_HEADS, seq_len, HEAD_DIM, backward=True)
+            
+            # Fwd TFLOPS
+            tflops_compiled = calculate_throughput(flop_fwd, time_compiled_fwd)
+            tflops_sdpa = calculate_throughput(flop_fwd, time_sdpa_fwd)
+            tflops_triton = calculate_throughput(flop_fwd, time_triton_fwd)
+            
+            # Combined TFLOPS
+            tflops_naive_train = calculate_throughput(flop_bwd, time_naive_bwd)
+            tflops_compiled_train = calculate_throughput(flop_bwd, time_compiled_bwd)
+            tflops_sdpa_train = calculate_throughput(flop_bwd, time_sdpa_bwd)
+            tflops_triton_train = calculate_throughput(flop_bwd, time_triton_bwd)
             
             results.append({
                 "SeqLen": seq_len,
-                "Naive (ms)": time_naive,
-                "Compiled (ms)": time_compiled,
-                "SDPA (ms)": time_sdpa,
-                "Triton (ms)": time_triton,
-                "Naive (MB)": mem_naive,
-                # "Compiled (MB)": mem_compiled, # 暂不显示，为了表格整洁
-                "SDPA (MB)": mem_sdpa,
-                "Triton (MB)": mem_triton,
-                "Naive (TFLOPS)": throughput_naive,
-                "Compiled (TFLOPS)": throughput_compiled,
-                "SDPA (TFLOPS)": throughput_sdpa,
-                "Triton (TFLOPS)": throughput_triton,
-                "Speedup vs Naive": time_naive / time_triton if time_naive == time_naive else float('inf'),
-                "Speedup vs SDPA": time_sdpa / time_triton if time_sdpa == time_sdpa else float('nan')
+                # Forward
+                "Comp Fwd(ms)": time_compiled_fwd,
+                "SDPA Fwd(ms)": time_sdpa_fwd,
+                "Tri Fwd(ms)": time_triton_fwd,
+                # Combined (Train)
+                "Naive Train(ms)": time_naive_bwd,
+                "Comp Train(ms)": time_compiled_bwd,
+                "SDPA Train(ms)": time_sdpa_bwd,
+                "Tri Train(ms)": time_triton_bwd,
+                
+                # Training Memory
+                "SDPA Mem(MB)": mem_sdpa_bwd,
+                "Tri Mem(MB)": mem_triton_bwd,
+                
+                # Training TFLOPS
+                "Naive TFLOPS": tflops_naive_train,
+                "SDPA TFLOPS": tflops_sdpa_train,
+                "Tri TFLOPS": tflops_triton_train,
+                
+                "Speedup (Train)": time_sdpa_bwd / time_triton_bwd if time_sdpa_bwd == time_sdpa_bwd else float('nan')
             })
             
         except Exception as e:
             print(f"Error at len {seq_len}: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Display results
     df = pd.DataFrame(results)
     
     # Save to CSV
-    csv_filename = "benchmark_results.csv"
+    csv_filename = "benchmark_train_results.csv"
     df.to_csv(csv_filename, index=False)
     print(f"\nResults saved to {csv_filename}")
-
-    print("\nBenchmark Results:")
+    
+    print("\nBenchmark Training Results:")
     try:
         print(df.to_markdown(index=False))
     except ImportError:
